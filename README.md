@@ -1,5 +1,5 @@
 # gspreadsheets-finance
-Google Spreadsheets scripts that provide functions to retrieve the closing price of a stock (US+EU markets) for a given date.
+Google Spreadsheets scripts providing functions to retrieve the closing price of a stock (US+EU markets) for a given date.
 
 ## Installation
 1) Go to a spreadsheet in [Google Spreadsheets](https://docs.google.com/spreadsheets/).
@@ -17,3 +17,8 @@ In the examples below, the cell `A1` contains a Date.
 ```python
 =EURONEXT_HIST("LU1681048804-XPAR";A1)
 ```
+
+## Notes
+I had to use these functions because `GOOGLEFINANCE()` often fails when refreshing data (& there's an annoying disclaimer).
+
+Also the ticker in the EU market example (above) is not consultable with it.
