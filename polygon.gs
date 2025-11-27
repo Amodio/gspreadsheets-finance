@@ -7,6 +7,19 @@ const RATE_LIMIT = 5;           // max calls per RATE_PERIOD_MS
 const RATE_PERIOD_MS = 60 * 1000; // 1 minute
 const CACHE_TTL_S = 24 * 60 * 60; // TTL 24h
 
+/* ---------- Shared function with euronext.gs ---------- */
+function _normalizeSheetsDate_(dateObj) {
+  if (!(dateObj instanceof Date)) throw new Error("Invalid date");
+
+  // Extract year, month, day
+  const y = dateObj.getFullYear();
+  const m = dateObj.getMonth(); // 0-based
+  const d = dateObj.getDate();
+
+  // Construct a date in UTC midnight
+  return new Date(Date.UTC(y, m, d));
+}
+
 /* ---------- 24-HOUR CACHE ---------- */
 function _poly_getYearCache_(ticker, year) {
   const cache = CacheService.getScriptCache();
