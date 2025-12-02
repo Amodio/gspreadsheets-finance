@@ -21,4 +21,4 @@ In the examples below, the cell `A1` contains a Date.
 ## Notes
 I had to use these functions because `GOOGLEFINANCE()` often fails when refreshing data (& there's an annoying disclaimer).
 
-Also the ticker in the EU market example (above) is not consultable with it.
+Also the ticker in the [EU market example (above)](https://live.euronext.com/en/product/etfs/LU1681048804-XPAR) is not consultable with it.
