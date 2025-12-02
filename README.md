@@ -29,4 +29,4 @@ I had to use these functions because `GOOGLEFINANCE()` often fails when refreshi
 
 Also the ticker in the [EU market example (above)](https://live.euronext.com/en/product/etfs/LU1681048804-XPAR) is not consultable with it.
 
-`=ECB_USD_RATE()` replaces `=INDEX(GOOGLEFINANCE("CURRENCY:EURUSD"; "close"; A5);2;2)`.
+`=ECB_USD_RATE()` replaces `=INDEX(GOOGLEFINANCE("CURRENCY:EURUSD"; "close"; A1);2;2)`.
