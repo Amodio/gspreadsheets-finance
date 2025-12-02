@@ -1,5 +1,5 @@
 # gspreadsheets-finance
-Google Spreadsheets scripts providing functions to retrieve the closing price of a stock (US+EU markets) for a given date.
+Google Spreadsheets scripts providing functions to retrieve the closing price of a stock (US+EU markets) for a given date + EUR/USD rate.
 
 ## Installation
 1) Go to a spreadsheet in [Google Spreadsheets](https://docs.google.com/spreadsheets/).
