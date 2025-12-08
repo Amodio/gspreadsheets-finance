@@ -1,129 +1,147 @@
 /**
- * ECB Euro/USD reference rate fetcher
- * 
- * This script fetches historical Euro/USD rates from ECB in XML (SDMX Compact)
- * and caches yearly data in Google Apps Script cache for 24 hours.
- * 
- * @customfunction
+ * ECB Euro/USD reference rate fetcher (concurrency safe)
+ *
+ * - Only fetches once per day per year
+ * - Uses PropertiesService for global shared storage
+ * - Prevents race conditions using a lock
+ * - Custom function: =ECB_USD_RATE(A1)
  */
 
-const ECB_CACHE_TTL = 24 * 60 * 60; // 24 hours in seconds
+const ECB_TTL_SECONDS = 24 * 60 * 60;  // 24 hours
+const ECB_TTL_MS = ECB_TTL_SECONDS * 1000;
+const LOCK_TIMEOUT_MS = 5000;          // Lock expires after 5 seconds
 
-/* ---------- Normalize Sheets Date ---------- */
+/* ----------------- Helper: normalize Sheets date ----------------- */
 function _normalizeSheetsDate_(dateObj) {
   if (!(dateObj instanceof Date)) throw new Error("Invalid date");
   return new Date(Date.UTC(dateObj.getFullYear(), dateObj.getMonth(), dateObj.getDate()));
 }
 
-/* ---------- Parse ECB XML ---------- */
+/* ----------------- ECB XML parsing ----------------- */
 function _ecb_parseXML_(xml) {
   const document = XmlService.parse(xml);
   const root = document.getRootElement();
 
-  // Recursive helper to find all <Obs> elements
-  function findObsElements(element) {
-    let obsList = [];
-    if (element.getName() === "Obs") {
-      obsList.push(element);
-    }
-    element.getChildren().forEach(child => {
-      obsList = obsList.concat(findObsElements(child));
-    });
-    return obsList;
+  function findObs(element) {
+    let list = [];
+    if (element.getName() === "Obs") list.push(element);
+    element.getChildren().forEach(c => list = list.concat(findObs(c)));
+    return list;
   }
 
-  const observations = findObsElements(root);
-  if (observations.length === 0) throw new Error("No <Obs> elements found in ECB XML");
+  const observations = findObs(root);
+  if (!observations.length) throw new Error("No <Obs> entries found");
 
   const daily = {};
   observations.forEach(obs => {
-    const dateAttr = obs.getAttribute("TIME_PERIOD");
-    const valueAttr = obs.getAttribute("OBS_VALUE");
-    if (dateAttr && valueAttr) {
-      const date = dateAttr.getValue();
-      const value = parseFloat(valueAttr.getValue());
-      daily[date] = value;
-    }
+    const d = obs.getAttribute("TIME_PERIOD")?.getValue();
+    const v = obs.getAttribute("OBS_VALUE")?.getValue();
+    if (d && v) daily[d] = parseFloat(v);
   });
 
   return daily;
 }
 
-/* ---------- 24-HOUR CACHE USING CacheService ---------- */
-function _ecb_getYearCache_(year) {
-  const cache = CacheService.getScriptCache();
-  const raw = cache.get(`ecb_usd_${year}`);
+/* ----------------- Global Storage (PropertiesService) ----------------- */
+function _getYearStore_(year) {
+  const props = PropertiesService.getScriptProperties();
+  const raw = props.getProperty(`ecb_usd_${year}`);
   return raw ? JSON.parse(raw) : null;
 }
 
-function _ecb_setYearCache_(year, data) {
-  const cache = CacheService.getScriptCache();
-  const key = `ecb_usd_${year}`;
-  cache.put(key, JSON.stringify(data), ECB_CACHE_TTL);
-
-  // Track cache keys
-  let keys = cache.get("ecb_cache_keys");
-  keys = keys ? JSON.parse(keys) : [];
-  if (!keys.includes(key)) keys.push(key);
-  cache.put("ecb_cache_keys", JSON.stringify(keys), ECB_CACHE_TTL);
+function _setYearStore_(year, data) {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty(
+    `ecb_usd_${year}`,
+    JSON.stringify({ ts: Date.now(), data })
+  );
 }
 
-/* ---------- Fetch ECB Year Data ---------- */
-function _ecb_fetchYearData_(year) {
-  const url = "https://www.ecb.europa.eu/stats/policy_and_exchange_rates/euro_reference_exchange_rates/html/usd.xml";
+/* ----------------- Distributed Lock ----------------- */
+
+function _tryLock_(year) {
+  const key = `lock_ecb_${year}`;
+  const props = PropertiesService.getScriptProperties();
+  const now = Date.now();
+
+  const existing = props.getProperty(key);
+  if (existing && now - parseInt(existing, 10) < LOCK_TIMEOUT_MS) {
+    return false;  // lock held
+  }
+
+  props.setProperty(key, now.toString());
+  return true;
+}
+
+function _unlock_(year) {
+  PropertiesService.getScriptProperties().deleteProperty(`lock_ecb_${year}`);
+}
+
+/* ----------------- Fetch ECB XML ----------------- */
+function _fetchECBXML_() {
+  const url = "https://www.ecb.europa.eu/stats/policy_and_exchange_rates/" +
+              "euro_reference_exchange_rates/html/usd.xml";
   const resp = UrlFetchApp.fetch(url);
 
   if (resp.getResponseCode() !== 200)
-    throw new Error("ECB fetch error: " + resp.getResponseCode());
+    throw new Error("ECB HTTP error " + resp.getResponseCode());
 
-  const daily = _ecb_parseXML_(resp.getContentText());
-
-  // Filter only this year
-  const yearData = {};
-  Object.keys(daily).forEach(date => {
-    if (date.startsWith(year.toString())) yearData[date] = daily[date];
-  });
-
-  return yearData;
+  return _ecb_parseXML_(resp.getContentText());
 }
 
-/* ---------- Clear ECB Cache ---------- */
-function clearECBHistory() {
-  const cache = CacheService.getScriptCache();
-  const keysRaw = cache.get("ecb_cache_keys");
+/* ----------------- Load year data, using shared cache + lock ----------------- */
+function _loadYearData_(year) {
+  let entry = _getYearStore_(year);
 
-  if (keysRaw) {
-    const keys = JSON.parse(keysRaw);
-    cache.removeAll(keys);
-    cache.remove("ecb_cache_keys");
-    Logger.log(`Removed ECB cache keys: ${keys}`);
+  // Fresh? Return immediately.
+  if (entry && Date.now() - entry.ts < ECB_TTL_MS) {
+    return entry.data;
   }
 
-  Logger.log("All ECB cache cleared.");
+  // Otherwise, try to acquire lock (1 other fetch happening allowed)
+  if (_tryLock_(year)) {
+    try {
+      // We own the lock — fetch fresh data
+      const all = _fetchECBXML_();
+
+      // Filter by year
+      const yearData = {};
+      Object.keys(all).forEach(d => {
+        if (d.startsWith(String(year))) yearData[d] = all[d];
+      });
+
+      _setYearStore_(year, yearData);
+      return yearData;
+    } finally {
+      _unlock_(year);
+    }
+  }
+
+  // Another execution is fetching → wait briefly & reload
+  Utilities.sleep(250);
+  entry = _getYearStore_(year);
+
+  if (entry) return entry.data;
+
+  // Fallback (should rarely fire)
+  return {};
 }
 
-/* ---------- PUBLIC FUNCTION ---------- */
+/* ----------------- Public Sheets function ----------------- */
 /**
- * Returns the ECB Euro/USD exchange rate for a given date.
- *
- * This caches yearly data in CacheService for 24 hours.
- * 
- * @param {Date} dateObj A date-formatted cell
- * @return {number|string} Exchange rate for the given date, or "No data"
+ * Returns the ECB EUR/USD reference rate for a given date.
+ * @param {Date} dateObj Sheets date
+ * @return {number|string} Exchange rate or "No data"
  * @customfunction
  */
 function ECB_USD_RATE(dateObj) {
-  if (!(dateObj instanceof Date)) throw new Error("Date must be a valid date object");
+  if (!(dateObj instanceof Date))
+    throw new Error("Argument must be a date");
 
-  const utcDate = _normalizeSheetsDate_(dateObj);
-  const year = utcDate.getUTCFullYear();
-  const key = Utilities.formatDate(utcDate, "UTC", "yyyy-MM-dd");
+  const utc = _normalizeSheetsDate_(dateObj);
+  const year = utc.getUTCFullYear();
+  const key = Utilities.formatDate(utc, "UTC", "yyyy-MM-dd");
 
-  let yearly = _ecb_getYearCache_(year);
-  if (!yearly) {
-    yearly = _ecb_fetchYearData_(year);
-    _ecb_setYearCache_(year, yearly);
-  }
-
-  return yearly[key] !== undefined ? yearly[key] : "No data";
+  const yearly = _loadYearData_(year);
+  return yearly[key] ?? "No data";
 }
