@@ -3,7 +3,7 @@
  */
 
 const POLYGON_API_KEY = "_YOUR_API_KEY_";
-const RATE_LIMIT = 5;           // max calls per RATE_PERIOD_MS
+const RATE_LIMIT = 5;             // max calls per RATE_PERIOD_MS
 const RATE_PERIOD_MS = 60 * 1000; // 1 minute
 const CACHE_TTL_S = 24 * 60 * 60; // TTL 24h
 
@@ -41,25 +41,29 @@ function _poly_setYearCache_(ticker, year, data) {
 
 /* ---------- RATE LIMITER ---------- */
 function _poly_waitForRateLimit_() {
-  const cache = CacheService.getScriptCache();
-  const now = Date.now();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(30000); // wait up to 30s
 
-  // Get timestamps from cache
-  let ts = cache.get("api_timestamps");
-  ts = ts ? JSON.parse(ts) : [];
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const now = Date.now();
 
-  // Remove old timestamps
-  ts = ts.filter(t => now - t < RATE_PERIOD_MS);
+    let ts = JSON.parse(props.getProperty("api_timestamps") || "[]");
 
-  if (ts.length >= RATE_LIMIT) {
-    const waitTime = RATE_PERIOD_MS - (now - ts[0]) + 50; // small buffer
-    Utilities.sleep(waitTime);
-    return _poly_waitForRateLimit_(); // retry
+    // Keep only last minute
+    ts = ts.filter(t => now - t < RATE_PERIOD_MS);
+
+    if (ts.length >= RATE_LIMIT) {
+      const waitTime = RATE_PERIOD_MS - (now - ts[0]) + 100;
+      Utilities.sleep(waitTime);
+      return _poly_waitForRateLimit_(); // retry safely (lock released)
+    }
+
+    ts.push(now);
+    props.setProperty("api_timestamps", JSON.stringify(ts));
+  } finally {
+    lock.releaseLock();
   }
-
-  // Record this call
-  ts.push(now);
-  cache.put("api_timestamps", JSON.stringify(ts), Math.ceil(RATE_PERIOD_MS / 1000));
 }
 
 /* ---------- Fetch Entire Year ---------- */
