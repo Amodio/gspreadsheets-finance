@@ -42,7 +42,7 @@ function _poly_setYearCache_(ticker, year, data) {
 /* ---------- RATE LIMITER ---------- */
 function _poly_waitForRateLimit_() {
   const lock = LockService.getScriptLock();
-  lock.waitLock(10000); // wait up to 10s
+  lock.waitLock(30000); // wait up to 30s
 
   try {
     const props = PropertiesService.getScriptProperties();
