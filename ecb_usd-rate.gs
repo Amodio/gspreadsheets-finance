@@ -100,11 +100,23 @@ function _ensureCurrentYearData_(requestedKey) {
   const currentYear = _normalizeSheetsDate_(new Date()).getUTCFullYear();
   let currentYearData = _getYearStore_(currentYear);
 
-  if (!currentYearData || !(requestedKey in currentYearData)) {
-    console.log(`Refreshing current year ${currentYear} for missing requested date ${requestedKey}`);
+  if (!currentYearData) {
+    // Year not cached at all → fetch
+    console.log(`Current year ${currentYear} not cached. Fetching...`);
     currentYearData = _loadYearData_(currentYear);
+    return currentYearData;
   }
 
+  // Check if any later date exists
+  const laterDatesExist = Object.keys(currentYearData).some(d => d > requestedKey);
+  if (laterDatesExist) {
+    console.log(`Requested date ${requestedKey} has no data, but later dates exist. Returning "No data" without fetching.`);
+    return currentYearData;
+  }
+
+  // Otherwise, requested past date is missing and no later data exists → fetch
+  console.log(`Refreshing current year ${currentYear} for missing requested date ${requestedKey}`);
+  currentYearData = _loadYearData_(currentYear);
   return currentYearData;
 }
 
