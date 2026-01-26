@@ -1,8 +1,8 @@
 /**
- * Optimized ECB EUR/USD fetcher
- * - Lock only when fetching XML
- * - Daily prefetch trigger for missing years
- * - Refresh current year if past date missing
+ * ECB EUR/USD fetcher (optimized)
+ * - Past years: cache once if missing
+ * - Current year: flush and refresh daily via trigger
+ * - Lock only around caching, no retry
  */
 
 const LOCK_TIMEOUT_MS = 5000; // 5s lock wait
@@ -23,6 +23,10 @@ function _setYearStore_(year, data) {
     `ecb_usd_${year}`,
     JSON.stringify(data)
   );
+}
+
+function _deleteYearStore_(year) {
+  PropertiesService.getScriptProperties().deleteProperty(`ecb_usd_${year}`);
 }
 
 /* ----------------- Fetch ECB XML ----------------- */
@@ -57,73 +61,54 @@ function _fetchECBXML_() {
   return daily;
 }
 
-/* ----------------- Load year data ----------------- */
-function _loadYearData_(year) {
-  // Check cache first
-  let stored = _getYearStore_(year);
-  if (stored) {
-    console.log(`Year ${year} already cached, returning immediately`);
-    return stored;
-  }
+/* ----------------- Daily prefetch trigger ----------------- */
+function _prefetchECBData_() {
+  console.log("Prefetch trigger started");
 
-  console.log(`Year ${year} missing, acquiring lock to fetch...`);
+  const currentYear = new Date().getUTCFullYear();
+
+  // 1️⃣ Flush current year's cache BEFORE downloading XML
+  console.log(`Flushing current year ${currentYear} cache`);
+  _deleteYearStore_(currentYear);
+
+  // 2️⃣ Fetch full ECB XML
+  const allData = _fetchECBXML_();
+
+  // 3️⃣ Lock around caching (no retry)
   const lock = LockService.getScriptLock();
+  lock.waitLock(LOCK_TIMEOUT_MS);
   try {
-    lock.waitLock(LOCK_TIMEOUT_MS);
+    console.log(`Lock acquired for caching`);
 
-    // Re-check cache after lock
-    stored = _getYearStore_(year);
-    if (stored) {
-      console.log(`Year ${year} cached while waiting, returning`);
-      return stored;
+    // Group data by year
+    const dataByYear = {};
+    for (const d in allData) {
+      const year = parseInt(d.slice(0, 4), 10);
+      if (!dataByYear[year]) dataByYear[year] = {};
+      dataByYear[year][d] = allData[d];
     }
 
-    // Fetch ECB XML
-    console.log("Fetching ECB XML...");
-    const all = _fetchECBXML_();
-    const yearData = {};
-    for (const d in all) if (d.startsWith(String(year))) yearData[d] = all[d];
+    // Cache each year
+    for (const yearStr in dataByYear) {
+      const year = parseInt(yearStr, 10);
 
-    _setYearStore_(year, yearData);
-    console.log(`Year ${year} cached successfully`);
-    return yearData;
+      // Past years: cache only if missing
+      if (year < currentYear && !_getYearStore_(year)) {
+        console.log(`Caching past year ${year}`);
+        _setYearStore_(year, dataByYear[year]);
+      }
+
+      // Current year: always cache (already flushed above)
+      if (year === currentYear) {
+        console.log(`Caching current year ${currentYear}`);
+        _setYearStore_(currentYear, dataByYear[year]);
+      }
+    }
+
+    console.log("Prefetch trigger finished");
   } finally {
-    try { lock.releaseLock(); } catch(_) {}
+    try { lock.releaseLock(); } catch (_) {}
   }
-}
-
-/* ----------------- Refresh current year if requested date missing ----------------- */
-function _ensureCurrentYearData_(requestedKey) {
-  const todayKey = Utilities.formatDate(_normalizeSheetsDate_(new Date()), "UTC", "yyyy-MM-dd");
-  if (requestedKey >= todayKey) throw new Error("ECB reference rate not available for today or future dates");
-
-  const currentYear = _normalizeSheetsDate_(new Date()).getUTCFullYear();
-  let currentYearData = _getYearStore_(currentYear);
-
-  if (!currentYearData) {
-    // Year not cached at all → fetch
-    console.log(`Current year ${currentYear} not cached. Fetching...`);
-    currentYearData = _loadYearData_(currentYear);
-    return currentYearData;
-  }
-
-  // Check if any later date exists
-  const laterDatesExist = Object.keys(currentYearData).some(d => d > requestedKey);
-
-  if (requestedKey in currentYearData) {
-    console.log(`Requested date ${requestedKey} found in cache. Returning value without fetching.`);
-    return currentYearData;
-  }
-
-  if (laterDatesExist) {
-    console.log(`Requested date ${requestedKey} has no data, but later dates exist. Returning cached data without fetching.`);
-    return currentYearData;
-  }
-
-  // Otherwise fetch
-  console.log(`Refreshing current year ${currentYear} for missing requested date ${requestedKey}`);
-  currentYearData = _loadYearData_(currentYear);
-  return currentYearData;
 }
 
 /* ----------------- Public Sheets function ----------------- */
@@ -133,49 +118,22 @@ function ECB_USD_RATE(dateObj) {
   const utc = _normalizeSheetsDate_(dateObj);
   const year = utc.getUTCFullYear();
   const key = Utilities.formatDate(utc, "UTC", "yyyy-MM-dd");
-  const todayKey = Utilities.formatDate(_normalizeSheetsDate_(new Date()), "UTC", "yyyy-MM-dd");
 
-  // Past years: fetch only if missing
-  if (year < new Date().getUTCFullYear()) {
-    const yearly = _loadYearData_(year);
-    return yearly[key] ?? "No data";
-  }
-
-  // Current year: ensure requested past date is in cache
-  if (year === new Date().getUTCFullYear()) {
-    const yearly = _ensureCurrentYearData_(key);
-    return yearly[key] ?? "No data";
-  }
-
-  throw new Error("ECB reference rate not available for future years");
+  const yearly = _getYearStore_(year);
+  return yearly ? (yearly[key] ?? "No data") : "No data";
 }
 
-/* ----------------- Daily prefetch trigger ----------------- */
-function prefetchMissingYears() {
-  const props = PropertiesService.getScriptProperties();
-  const cachedYears = Object.keys(props.getProperties())
-    .filter(k => k.startsWith('ecb_usd_'))
-    .map(k => parseInt(k.replace('ecb_usd_', '')));
-
-  const currentYear = new Date().getUTCFullYear();
-  const lastCachedYear = cachedYears.length ? Math.max(...cachedYears) : 0;
-
-  for (let year = lastCachedYear + 1; year <= currentYear; year++) {
-    console.log(`Prefetching missing year ${year}`);
-    _loadYearData_(year);
-  }
-}
-
+/**
+ * Automatically create the daily prefetch trigger when the script is installed
+ */
 /* ----------------- Install daily trigger ----------------- */
-function createDailyPrefetchTrigger() {
+function onInstall(e) {
   const triggers = ScriptApp.getProjectTriggers();
   triggers.forEach(t => {
-    if (t.getHandlerFunction() === "prefetchMissingYears") {
-      ScriptApp.deleteTrigger(t);
-    }
+    if (t.getHandlerFunction() === "_prefetchECBData_") ScriptApp.deleteTrigger(t);
   });
 
-  ScriptApp.newTrigger("prefetchMissingYears")
+  ScriptApp.newTrigger("_prefetchECBData_")
     .timeBased()
     .everyDays(1)
     .atHour(0)
@@ -185,21 +143,34 @@ function createDailyPrefetchTrigger() {
   console.log("Daily prefetch trigger installed");
 }
 
-/* ----------------- Manual flush all cache ----------------- */
+/* ----------------- Manual flush & repopulate all the cache ----------------- */
 function flushAllECBCache() {
   const props = PropertiesService.getScriptProperties();
   const keys = Object.keys(props.getProperties()).filter(k => k.startsWith('ecb_usd_'));
-
-  if (keys.length === 0) {
-    console.log("No ECB cache to delete.");
-    return;
-  }
-
   keys.forEach(k => props.deleteProperty(k));
   console.log("Deleted ECB cache keys:", keys.join(", "));
+  _prefetchECBData_();
 }
 
 /* ----------------- Test ----------------- */
 function testECB() {
   console.log(ECB_USD_RATE(new Date("2026-01-02")));
+}
+
+function listTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  if (triggers.length === 0) {
+    console.log("No triggers found.");
+    return;
+  }
+  
+  triggers.forEach((t, i) => {
+    console.log(`Trigger ${i + 1}:`);
+    console.log(`  ID: ${t.getUniqueId()}`);
+    console.log(`  Handler Function: ${t.getHandlerFunction()}`);
+    console.log(`  Trigger Type: ${t.getEventType()}`); // e.g., CLOCK, ON_OPEN
+    console.log(`  Source ID: ${t.getTriggerSourceId()}`);
+    console.log(`  Source: ${t.getTriggerSource()}`);
+    console.log(`  Creation Time: ${t.getTriggerSourceId()}`);
+  });
 }
