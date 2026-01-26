@@ -1,37 +1,55 @@
 /**
- * ECB Euro/USD reference rate fetcher (concurrency safe)
+ * ECB EUR/USD reference rate fetcher (fetch-on-demand, concurrency-safe, with logging)
  *
- * - Only fetches once per day per year
- * - Uses PropertiesService for global shared storage
- * - Prevents race conditions using a lock
- * - Custom function: =ECB_USD_RATE(A1)
+ * - Fetches data only if missing
+ * - Past years: fetch once
+ * - Current year: fetch missing days
+ * - Throws for today/future dates
+ * - Logs each step to help diagnose execution time
+ * - Flush all cache with logging
  */
 
-const ECB_TTL_SECONDS = 24 * 60 * 60;  // 24 hours
-const ECB_TTL_MS = ECB_TTL_SECONDS * 1000;
-const LOCK_TIMEOUT_MS = 5000;          // Lock expires after 5 seconds
+const LOCK_TIMEOUT_MS = 5000; // 5s lock wait
 
-/* ----------------- Helper: normalize Sheets date ----------------- */
+/* ----------------- Helpers ----------------- */
 function _normalizeSheetsDate_(dateObj) {
   if (!(dateObj instanceof Date)) throw new Error("Invalid date");
   return new Date(Date.UTC(dateObj.getFullYear(), dateObj.getMonth(), dateObj.getDate()));
 }
 
-/* ----------------- ECB XML parsing ----------------- */
-function _ecb_parseXML_(xml) {
-  const document = XmlService.parse(xml);
+function _getYearStore_(year) {
+  const raw = PropertiesService.getScriptProperties().getProperty(`ecb_usd_${year}`);
+  return raw ? JSON.parse(raw) : null;
+}
+
+function _setYearStore_(year, data) {
+  PropertiesService.getScriptProperties().setProperty(
+    `ecb_usd_${year}`,
+    JSON.stringify(data)
+  );
+}
+
+/* ----------------- Fetch ECB XML ----------------- */
+function _fetchECBXML_() {
+  console.time("ECB fetch time");
+  const url =
+    "https://www.ecb.europa.eu/stats/policy_and_exchange_rates/" +
+    "euro_reference_exchange_rates/html/usd.xml";
+
+  const resp = UrlFetchApp.fetch(url);
+  if (resp.getResponseCode() !== 200) throw new Error("ECB HTTP error " + resp.getResponseCode());
+
+  const document = XmlService.parse(resp.getContentText());
   const root = document.getRootElement();
 
-  function findObs(element) {
-    let list = [];
-    if (element.getName() === "Obs") list.push(element);
-    element.getChildren().forEach(c => list = list.concat(findObs(c)));
-    return list;
+  function findObs(el) {
+    let out = [];
+    if (el.getName() === "Obs") out.push(el);
+    el.getChildren().forEach(c => out = out.concat(findObs(c)));
+    return out;
   }
 
   const observations = findObs(root);
-  if (!observations.length) throw new Error("No <Obs> entries found");
-
   const daily = {};
   observations.forEach(obs => {
     const d = obs.getAttribute("TIME_PERIOD")?.getValue();
@@ -39,109 +57,93 @@ function _ecb_parseXML_(xml) {
     if (d && v) daily[d] = parseFloat(v);
   });
 
+  console.timeEnd("ECB fetch time");
   return daily;
 }
 
-/* ----------------- Global Storage (PropertiesService) ----------------- */
-function _getYearStore_(year) {
-  const props = PropertiesService.getScriptProperties();
-  const raw = props.getProperty(`ecb_usd_${year}`);
-  return raw ? JSON.parse(raw) : null;
-}
+/* ----------------- Load year data (with lock and logging) ----------------- */
+function _loadYearData_(year, requestedKey) {
+  const start = Date.now();
+  console.log(`_loadYearData_ started for year=${year}, requestedKey=${requestedKey}`);
 
-function _setYearStore_(year, data) {
-  const props = PropertiesService.getScriptProperties();
-  props.setProperty(
-    `ecb_usd_${year}`,
-    JSON.stringify({ ts: Date.now(), data })
-  );
-}
+  const todayKey = Utilities.formatDate(_normalizeSheetsDate_(new Date()), "UTC", "yyyy-MM-dd");
+  if (requestedKey >= todayKey) throw new Error("ECB reference rate not available for today or future dates");
 
-/* ----------------- Distributed Lock ----------------- */
-
-function _tryLock_(year) {
-  const key = `lock_ecb_${year}`;
-  const props = PropertiesService.getScriptProperties();
-  const now = Date.now();
-
-  const existing = props.getProperty(key);
-  if (existing && now - parseInt(existing, 10) < LOCK_TIMEOUT_MS) {
-    return false;  // lock held
+  // Check cache
+  let stored = _getYearStore_(year);
+  if (stored && requestedKey in stored) {
+    console.log(`Cache hit for ${requestedKey}, returning immediately`);
+    console.log(`_loadYearData_ finished in ${Date.now() - start} ms`);
+    return stored;
   }
 
-  props.setProperty(key, now.toString());
-  return true;
-}
+  console.log("Cache miss, acquiring lock...");
+  const lock = LockService.getScriptLock();
+  const maxRetries = 5;
+  const retryDelay = 500; // ms
 
-function _unlock_(year) {
-  PropertiesService.getScriptProperties().deleteProperty(`lock_ecb_${year}`);
-}
-
-/* ----------------- Fetch ECB XML ----------------- */
-function _fetchECBXML_() {
-  const url = "https://www.ecb.europa.eu/stats/policy_and_exchange_rates/" +
-              "euro_reference_exchange_rates/html/usd.xml";
-  const resp = UrlFetchApp.fetch(url);
-
-  if (resp.getResponseCode() !== 200)
-    throw new Error("ECB HTTP error " + resp.getResponseCode());
-
-  return _ecb_parseXML_(resp.getContentText());
-}
-
-/* ----------------- Load year data, using shared cache + lock ----------------- */
-function _loadYearData_(year) {
-  let entry = _getYearStore_(year);
-
-  // Fresh? Return immediately.
-  if (entry && Date.now() - entry.ts < ECB_TTL_MS) {
-    return entry.data;
-  }
-
-  // Otherwise, try to acquire lock (1 other fetch happening allowed)
-  if (_tryLock_(year)) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      // We own the lock — fetch fresh data
+      const lockStart = Date.now();
+      lock.waitLock(LOCK_TIMEOUT_MS);
+      console.log(`Lock acquired in ${Date.now() - lockStart} ms (attempt ${attempt + 1})`);
+
+      // Double-check cache after lock
+      stored = _getYearStore_(year);
+      if (stored && requestedKey in stored) {
+        console.log(`Cache populated during wait, returning immediately`);
+        console.log(`_loadYearData_ finished in ${Date.now() - start} ms`);
+        return stored;
+      }
+
+      // Fetch ECB XML
+      console.log("Fetching ECB XML...");
       const all = _fetchECBXML_();
+      console.log("ECB XML fetched, storing year data...");
 
-      // Filter by year
-      const yearData = {};
-      Object.keys(all).forEach(d => {
+      const yearData = stored || {};
+      for (const d in all) {
         if (d.startsWith(String(year))) yearData[d] = all[d];
-      });
-
+      }
       _setYearStore_(year, yearData);
+
+      console.log(`Year ${year} stored, total duration ${Date.now() - start} ms`);
       return yearData;
+
+    } catch (e) {
+      console.warn(`Lock attempt ${attempt + 1} failed: ${e.message}`);
+      if (attempt === maxRetries - 1) throw e;
+      Utilities.sleep(retryDelay);
     } finally {
-      _unlock_(year);
+      try { lock.releaseLock(); } catch(_) {}
     }
   }
+}
 
-  // Another execution is fetching → wait briefly & reload
-  Utilities.sleep(250);
-  entry = _getYearStore_(year);
+/* ----------------- Manual flush all cache ----------------- */
+function flushAllECBCache() {
+  const props = PropertiesService.getScriptProperties();
+  const keys = Object.keys(props.getProperties()).filter(k => k.startsWith('ecb_usd_'));
 
-  if (entry) return entry.data;
+  if (keys.length === 0) {
+    console.log("No ECB cache to delete.");
+    return;
+  }
 
-  // Fallback (should rarely fire)
-  return {};
+  keys.forEach(k => props.deleteProperty(k));
+  console.log("Deleted ECB cache keys:", keys.join(", "));
 }
 
 /* ----------------- Public Sheets function ----------------- */
-/**
- * Returns the ECB EUR/USD reference rate for a given date.
- * @param {Date} dateObj Sheets date
- * @return {number|string} Exchange rate or "No data"
- * @customfunction
- */
 function ECB_USD_RATE(dateObj) {
-  if (!(dateObj instanceof Date))
-    throw new Error("Argument must be a date");
+  if (!(dateObj instanceof Date)) throw new Error("Argument must be a date");
 
   const utc = _normalizeSheetsDate_(dateObj);
   const year = utc.getUTCFullYear();
   const key = Utilities.formatDate(utc, "UTC", "yyyy-MM-dd");
 
-  const yearly = _loadYearData_(year);
-  return yearly[key] ?? "No data";
+  const yearly = _loadYearData_(year, key);
+  if (!(key in yearly)) throw new Error("No ECB data for requested date");
+
+  return yearly[key];
 }
