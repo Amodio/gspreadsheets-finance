@@ -109,12 +109,18 @@ function _ensureCurrentYearData_(requestedKey) {
 
   // Check if any later date exists
   const laterDatesExist = Object.keys(currentYearData).some(d => d > requestedKey);
-  if (laterDatesExist) {
-    console.log(`Requested date ${requestedKey} has no data, but later dates exist. Returning "No data" without fetching.`);
+
+  if (requestedKey in currentYearData) {
+    console.log(`Requested date ${requestedKey} found in cache. Returning value without fetching.`);
     return currentYearData;
   }
 
-  // Otherwise, requested past date is missing and no later data exists → fetch
+  if (laterDatesExist) {
+    console.log(`Requested date ${requestedKey} has no data, but later dates exist. Returning cached data without fetching.`);
+    return currentYearData;
+  }
+
+  // Otherwise fetch
   console.log(`Refreshing current year ${currentYear} for missing requested date ${requestedKey}`);
   currentYearData = _loadYearData_(currentYear);
   return currentYearData;
