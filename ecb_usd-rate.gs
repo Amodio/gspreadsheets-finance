@@ -77,6 +77,14 @@ function _loadYearData_(year, requestedKey) {
     return stored;
   }
 
+  // Check if we have data for any later date in the same year
+  const laterDatesExist = stored && Object.keys(stored).some(d => d > requestedKey);
+  if (laterDatesExist) {
+    console.log(`Requested date ${requestedKey} has no data, but later dates exist. Returning "No data" without fetching.`);
+    console.log(`_loadYearData_ finished in ${Date.now() - start} ms`);
+    return {};
+  }
+
   console.log("Cache miss, acquiring lock...");
   const lock = LockService.getScriptLock();
   const maxRetries = 5;
@@ -143,7 +151,7 @@ function ECB_USD_RATE(dateObj) {
   const key = Utilities.formatDate(utc, "UTC", "yyyy-MM-dd");
 
   const yearly = _loadYearData_(year, key);
-  if (!(key in yearly)) throw new Error("No ECB data for requested date");
+  if (!(key in yearly)) return "No data";
 
   return yearly[key];
 }
