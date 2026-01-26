@@ -1,12 +1,8 @@
 /**
- * ECB EUR/USD reference rate fetcher (fetch-on-demand, concurrency-safe, with logging)
- *
- * - Fetches data only if missing
- * - Past years: fetch once
- * - Current year: fetch missing days
- * - Throws for today/future dates
- * - Logs each step to help diagnose execution time
- * - Flush all cache with logging
+ * Optimized ECB EUR/USD fetcher
+ * - Lock only when fetching XML
+ * - Daily prefetch trigger for missing years
+ * - Refresh current year if past date missing
  */
 
 const LOCK_TIMEOUT_MS = 5000; // 5s lock wait
@@ -61,71 +57,114 @@ function _fetchECBXML_() {
   return daily;
 }
 
-/* ----------------- Load year data (with lock and logging) ----------------- */
-function _loadYearData_(year, requestedKey) {
-  const start = Date.now();
-  console.log(`_loadYearData_ started for year=${year}, requestedKey=${requestedKey}`);
-
-  const todayKey = Utilities.formatDate(_normalizeSheetsDate_(new Date()), "UTC", "yyyy-MM-dd");
-  if (requestedKey >= todayKey) throw new Error("ECB reference rate not available for today or future dates");
-
-  // Check cache
+/* ----------------- Load year data ----------------- */
+function _loadYearData_(year) {
+  // Check cache first
   let stored = _getYearStore_(year);
-  if (stored && requestedKey in stored) {
-    console.log(`Cache hit for ${requestedKey}, returning immediately`);
-    console.log(`_loadYearData_ finished in ${Date.now() - start} ms`);
+  if (stored) {
+    console.log(`Year ${year} already cached, returning immediately`);
     return stored;
   }
 
-  // Check if we have data for any later date in the same year
-  const laterDatesExist = stored && Object.keys(stored).some(d => d > requestedKey);
-  if (laterDatesExist) {
-    console.log(`Requested date ${requestedKey} has no data, but later dates exist. Returning "No data" without fetching.`);
-    console.log(`_loadYearData_ finished in ${Date.now() - start} ms`);
-    return {};
-  }
-
-  console.log("Cache miss, acquiring lock...");
+  console.log(`Year ${year} missing, acquiring lock to fetch...`);
   const lock = LockService.getScriptLock();
-  const maxRetries = 5;
-  const retryDelay = 500; // ms
+  try {
+    lock.waitLock(LOCK_TIMEOUT_MS);
 
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    try {
-      const lockStart = Date.now();
-      lock.waitLock(LOCK_TIMEOUT_MS);
-      console.log(`Lock acquired in ${Date.now() - lockStart} ms (attempt ${attempt + 1})`);
-
-      // Double-check cache after lock
-      stored = _getYearStore_(year);
-      if (stored && requestedKey in stored) {
-        console.log(`Cache populated during wait, returning immediately`);
-        console.log(`_loadYearData_ finished in ${Date.now() - start} ms`);
-        return stored;
-      }
-
-      // Fetch ECB XML
-      console.log("Fetching ECB XML...");
-      const all = _fetchECBXML_();
-      console.log("ECB XML fetched, storing year data...");
-
-      const yearData = stored || {};
-      for (const d in all) {
-        if (d.startsWith(String(year))) yearData[d] = all[d];
-      }
-      _setYearStore_(year, yearData);
-
-      console.log(`Year ${year} stored, total duration ${Date.now() - start} ms`);
-      return yearData;
-
-    } catch (e) {
-      console.warn(`Lock attempt ${attempt + 1} failed: ${e.message}`);
-      if (attempt === maxRetries - 1) throw e;
-      Utilities.sleep(retryDelay);
-    } finally {
-      try { lock.releaseLock(); } catch(_) {}
+    // Re-check cache after lock
+    stored = _getYearStore_(year);
+    if (stored) {
+      console.log(`Year ${year} cached while waiting, returning`);
+      return stored;
     }
+
+    // Fetch ECB XML
+    console.log("Fetching ECB XML...");
+    const all = _fetchECBXML_();
+    const yearData = {};
+    for (const d in all) if (d.startsWith(String(year))) yearData[d] = all[d];
+
+    _setYearStore_(year, yearData);
+    console.log(`Year ${year} cached successfully`);
+    return yearData;
+  } finally {
+    try { lock.releaseLock(); } catch(_) {}
   }
+}
+
+/* ----------------- Refresh current year if requested date missing ----------------- */
+function _ensureCurrentYearData_(requestedKey) {
+  const todayKey = Utilities.formatDate(_normalizeSheetsDate_(new Date()), "UTC", "yyyy-MM-dd");
+  if (requestedKey >= todayKey) throw new Error("ECB reference rate not available for today or future dates");
+
+  const currentYear = _normalizeSheetsDate_(new Date()).getUTCFullYear();
+  let currentYearData = _getYearStore_(currentYear);
+
+  if (!currentYearData || !(requestedKey in currentYearData)) {
+    console.log(`Refreshing current year ${currentYear} for missing requested date ${requestedKey}`);
+    currentYearData = _loadYearData_(currentYear);
+  }
+
+  return currentYearData;
+}
+
+/* ----------------- Public Sheets function ----------------- */
+function ECB_USD_RATE(dateObj) {
+  if (!(dateObj instanceof Date)) throw new Error("Argument must be a date");
+
+  const utc = _normalizeSheetsDate_(dateObj);
+  const year = utc.getUTCFullYear();
+  const key = Utilities.formatDate(utc, "UTC", "yyyy-MM-dd");
+  const todayKey = Utilities.formatDate(_normalizeSheetsDate_(new Date()), "UTC", "yyyy-MM-dd");
+
+  // Past years: fetch only if missing
+  if (year < new Date().getUTCFullYear()) {
+    const yearly = _loadYearData_(year);
+    return yearly[key] ?? "No data";
+  }
+
+  // Current year: ensure requested past date is in cache
+  if (year === new Date().getUTCFullYear()) {
+    const yearly = _ensureCurrentYearData_(key);
+    return yearly[key] ?? "No data";
+  }
+
+  throw new Error("ECB reference rate not available for future years");
+}
+
+/* ----------------- Daily prefetch trigger ----------------- */
+function prefetchMissingYears() {
+  const props = PropertiesService.getScriptProperties();
+  const cachedYears = Object.keys(props.getProperties())
+    .filter(k => k.startsWith('ecb_usd_'))
+    .map(k => parseInt(k.replace('ecb_usd_', '')));
+
+  const currentYear = new Date().getUTCFullYear();
+  const lastCachedYear = cachedYears.length ? Math.max(...cachedYears) : 0;
+
+  for (let year = lastCachedYear + 1; year <= currentYear; year++) {
+    console.log(`Prefetching missing year ${year}`);
+    _loadYearData_(year);
+  }
+}
+
+/* ----------------- Install daily trigger ----------------- */
+function createDailyPrefetchTrigger() {
+  const triggers = ScriptApp.getProjectTriggers();
+  triggers.forEach(t => {
+    if (t.getHandlerFunction() === "prefetchMissingYears") {
+      ScriptApp.deleteTrigger(t);
+    }
+  });
+
+  ScriptApp.newTrigger("prefetchMissingYears")
+    .timeBased()
+    .everyDays(1)
+    .atHour(0)
+    .nearMinute(5)
+    .create();
+
+  console.log("Daily prefetch trigger installed");
 }
 
 /* ----------------- Manual flush all cache ----------------- */
@@ -142,16 +181,7 @@ function flushAllECBCache() {
   console.log("Deleted ECB cache keys:", keys.join(", "));
 }
 
-/* ----------------- Public Sheets function ----------------- */
-function ECB_USD_RATE(dateObj) {
-  if (!(dateObj instanceof Date)) throw new Error("Argument must be a date");
-
-  const utc = _normalizeSheetsDate_(dateObj);
-  const year = utc.getUTCFullYear();
-  const key = Utilities.formatDate(utc, "UTC", "yyyy-MM-dd");
-
-  const yearly = _loadYearData_(year, key);
-  if (!(key in yearly)) return "No data";
-
-  return yearly[key];
+/* ----------------- Test ----------------- */
+function testECB() {
+  console.log(ECB_USD_RATE(new Date("2026-01-02")));
 }
