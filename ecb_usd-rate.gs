@@ -62,8 +62,8 @@ function _fetchECBXML_() {
 }
 
 /* ----------------- Daily prefetch trigger ----------------- */
-function _prefetchECBData_() {
-  console.log("Prefetch trigger started");
+function prefetchECBData() {
+  console.log("Fetching ECB data...");
 
   const currentYear = new Date().getUTCFullYear();
 
@@ -125,52 +125,31 @@ function ECB_USD_RATE(dateObj) {
 
 /**
  * Automatically create the daily prefetch trigger when the script is installed
+ * Don’t run at midnight otherwise it times out as:
+ * - Google executes a lot of App Scripts at midnight
+ * - ECB updates after European market open.
  */
-/* ----------------- Install daily trigger ----------------- */
+/* ----------------- Install daily trigger + first prefetch ----------------- */
 function onInstall(e) {
   const triggers = ScriptApp.getProjectTriggers();
   triggers.forEach(t => {
-    if (t.getHandlerFunction() === "_prefetchECBData_") ScriptApp.deleteTrigger(t);
+    if (t.getHandlerFunction() === "prefetchECBData") ScriptApp.deleteTrigger(t);
   });
-
-  ScriptApp.newTrigger("_prefetchECBData_")
+  ScriptApp.newTrigger("prefetchECBData")
     .timeBased()
     .everyDays(1)
-    .atHour(0)
-    .nearMinute(5)
+    .atHour(9)
+    .nearMinute(15)
     .create();
-
   console.log("Daily prefetch trigger installed");
+
+  prefetchECBData();
 }
 
-/* ----------------- Manual flush & repopulate all the cache ----------------- */
+/* ----------------- Manual flush of the cache ----------------- */
 function flushAllECBCache() {
   const props = PropertiesService.getScriptProperties();
   const keys = Object.keys(props.getProperties()).filter(k => k.startsWith('ecb_usd_'));
   keys.forEach(k => props.deleteProperty(k));
   console.log("Deleted ECB cache keys:", keys.join(", "));
-  _prefetchECBData_();
-}
-
-/* ----------------- Test ----------------- */
-function testECB() {
-  console.log(ECB_USD_RATE(new Date("2026-01-02")));
-}
-
-function listTriggers() {
-  const triggers = ScriptApp.getProjectTriggers();
-  if (triggers.length === 0) {
-    console.log("No triggers found.");
-    return;
-  }
-  
-  triggers.forEach((t, i) => {
-    console.log(`Trigger ${i + 1}:`);
-    console.log(`  ID: ${t.getUniqueId()}`);
-    console.log(`  Handler Function: ${t.getHandlerFunction()}`);
-    console.log(`  Trigger Type: ${t.getEventType()}`); // e.g., CLOCK, ON_OPEN
-    console.log(`  Source ID: ${t.getTriggerSourceId()}`);
-    console.log(`  Source: ${t.getTriggerSource()}`);
-    console.log(`  Creation Time: ${t.getTriggerSourceId()}`);
-  });
 }
