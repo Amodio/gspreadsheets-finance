@@ -66,15 +66,7 @@ function prefetchECBData() {
   console.log("Fetching ECB data...");
 
   const currentYear = new Date().getUTCFullYear();
-
-  // 1️⃣ Flush current year's cache BEFORE downloading XML
-  console.log(`Flushing current year ${currentYear} cache`);
-  _deleteYearStore_(currentYear);
-
-  // 2️⃣ Fetch full ECB XML
   const allData = _fetchECBXML_();
-
-  // 3️⃣ Lock around caching (no retry)
   const lock = LockService.getScriptLock();
   lock.waitLock(LOCK_TIMEOUT_MS);
   try {
@@ -100,6 +92,7 @@ function prefetchECBData() {
 
       // Current year: always cache (already flushed above)
       if (year === currentYear) {
+        _deleteYearStore_(currentYear);
         console.log(`Caching current year ${currentYear}`);
         _setYearStore_(currentYear, dataByYear[year]);
       }
@@ -111,23 +104,11 @@ function prefetchECBData() {
   }
 }
 
-/* ----------------- Public Sheets function ----------------- */
-function ECB_USD_RATE(dateObj) {
-  if (!(dateObj instanceof Date)) throw new Error("Argument must be a date");
-
-  const utc = _normalizeSheetsDate_(dateObj);
-  const year = utc.getUTCFullYear();
-  const key = Utilities.formatDate(utc, "UTC", "yyyy-MM-dd");
-
-  const yearly = _getYearStore_(year);
-  return yearly ? (yearly[key] ?? "No data") : "No data";
-}
-
 /**
  * Automatically create the daily prefetch trigger when the script is installed
  * Don’t run at midnight otherwise it times out as:
  * - Google executes a lot of App Scripts at midnight
- * - ECB updates after European market open.
+ * - ECB updates at about 4pm GMT+1.
  */
 /* ----------------- Install daily trigger + first prefetch ----------------- */
 function onInstall(e) {
@@ -138,12 +119,24 @@ function onInstall(e) {
   ScriptApp.newTrigger("prefetchECBData")
     .timeBased()
     .everyDays(1)
-    .atHour(9)
-    .nearMinute(15)
+    .atHour(17)
+    .nearMinute(0)
     .create();
   console.log("Daily prefetch trigger installed");
 
   prefetchECBData();
+}
+
+/* ----------------- Public Sheets function ----------------- */
+function ECB_USD_RATE(dateObj) {
+  if (!(dateObj instanceof Date)) throw new Error("Argument must be a date");
+
+  const utc = _normalizeSheetsDate_(dateObj);
+  const year = utc.getUTCFullYear();
+  const key = Utilities.formatDate(utc, "UTC", "yyyy-MM-dd");
+
+  const yearly = _getYearStore_(year);
+  return yearly ? (yearly[key] ?? "No data") : "No data for this year";
 }
 
 /* ----------------- Manual flush of the cache ----------------- */
