@@ -6,6 +6,56 @@ const EURONEXT_RATE_LIMIT = 5;           // max calls per RATE_PERIOD_MS
 const EURONEXT_RATE_PERIOD_MS = 60 * 1000; // 1 minute
 const EURONEXT_CACHE_TTL = 24 * 60 * 60; // 24 hours in seconds
 
+const EURONEXT_KEY = "24ayqVo7yJma";
+
+/**
+ * Decrypt a CryptoJS-format AES-CBC payload.
+ * Replaces the broken Utilities.CipherAlgorithm approach.
+ */
+function _euronext_decrypt_(json, password) {
+  if (typeof json === "string") json = JSON.parse(json);
+
+  const cache = CacheService.getScriptCache();
+  let cryptoJsSrc = cache.get("cryptojs_src");
+  if (!cryptoJsSrc) {
+    const resp = UrlFetchApp.fetch(
+      "https://cdnjs.cloudflare.com/ajax/libs/crypto-js/4.2.0/crypto-js.min.js"
+    );
+    cryptoJsSrc = resp.getContentText();
+    cache.put("cryptojs_src", cryptoJsSrc, 21600);
+  }
+  eval(cryptoJsSrc);
+
+  // CryptoJSAesJson format:
+  //   ct  → Base64
+  //   iv  → HEX
+  //   s   → HEX
+  var CryptoJSAesJson = {
+    parse: function(jsonStr) {
+      var j = JSON.parse(jsonStr);
+      var cipherParams = CryptoJS.lib.CipherParams.create({
+        ciphertext: CryptoJS.enc.Base64.parse(j.ct)
+      });
+      if (j.iv) cipherParams.iv   = CryptoJS.enc.Hex.parse(j.iv);
+      if (j.s)  cipherParams.salt = CryptoJS.enc.Hex.parse(j.s);
+      return cipherParams;
+    }
+  };
+
+  const cipherParams = CryptoJSAesJson.parse(JSON.stringify(json));
+
+  const decrypted = CryptoJS.AES.decrypt(cipherParams, password, {
+    iv:      cipherParams.iv,
+    salt:    cipherParams.salt,
+    mode:    CryptoJS.mode.CBC,
+    padding: CryptoJS.pad.Pkcs7
+  });
+
+  const result = decrypted.toString(CryptoJS.enc.Utf8);
+  if (!result) throw new Error("Decryption produced empty result — wrong key or format?");
+  return result;
+}
+
 /* ---------- Shared function with polygon.gs ---------- */
 function _normalizeSheetsDate_(dateObj) {
   if (!(dateObj instanceof Date)) throw new Error("Invalid date");
@@ -22,13 +72,24 @@ function _normalizeSheetsDate_(dateObj) {
 /* ---------- Parse Euronext HTML Table ---------- */
 function _euronext_parseEuronextHTML_(html) {
   const daily = {};
-  const regex = /<tr class="[^"]*">[\s\S]*?<td class="historical-time">[\s\S]*?<span>(\d{2}\/\d{2}\/\d{4})<\/span>[\s\S]*?<td class="historical-close[^"]*">([\d.,]+)<\/td>/g;
-  let match;
-  while ((match = regex.exec(html)) !== null) {
-    const dateParts = match[1].split("/");
-    const dateStr = `${dateParts[2]}-${dateParts[1]}-${dateParts[0]}`; // yyyy-MM-dd
-    const close = parseFloat(match[2].replace(",", ""));
-    daily[dateStr] = close;
+
+  const dateOnlyRegex = /<td class="historical-time">\s*<span>(\d{2}\/\d{2}\/\d{4})<\/span>/g;
+  const closeOnlyRegex = /<td class="historical-close[^"]*">([\d.,]+)<\/td>/g;
+
+  const dates = [];
+  const closes = [];
+  let m;
+
+  while ((m = dateOnlyRegex.exec(html)) !== null) dates.push(m[1]);
+  while ((m = closeOnlyRegex.exec(html)) !== null) closes.push(m[1]);
+
+  if (dates.length !== closes.length) {
+    throw new Error(`Euronext parse mismatch: ${dates.length} dates vs ${closes.length} closes`);
+  }
+
+  for (let i = 0; i < dates.length; i++) {
+    const p = dates[i].split("/");
+    daily[`${p[2]}-${p[1]}-${p[0]}`] = parseFloat(closes[i].replace(/,/g, ""));
   }
 
   return daily;
@@ -102,7 +163,29 @@ function _euronext_fetchYearData_(ticker, year) {
   if (resp.getResponseCode() !== 200)
     throw new Error("Euronext Error " + resp.getResponseCode());
 
-  return _euronext_parseEuronextHTML_(resp.getContentText());
+  const body = resp.getContentText();
+
+  let decrypted;
+    try {
+      const parsed = JSON.parse(body);
+      if (parsed.ct && parsed.iv && parsed.s) {
+        decrypted = _euronext_decrypt_(parsed, EURONEXT_KEY);
+      } else {
+        decrypted = body;
+      }
+    } catch (e) {
+      throw new Error("Decrypt/parse failed: " + e);
+    }
+
+    // Decrypted value is a JSON-encoded string — unwrap it
+    let html;
+    try {
+      html = JSON.parse(decrypted);
+    } catch(e) {
+      html = decrypted;
+    }
+
+    return _euronext_parseEuronextHTML_(html);
 }
 
 /* ---------- Clear Cache ---------- */
@@ -141,16 +224,25 @@ function EURONEXT_HIST(ticker, dateObj) {
     throw new Error("Date must be a valid date object");
 
   const year = dateObj.getUTCFullYear();
-  // Normalize date from Sheets cell
   const utcDate = _normalizeSheetsDate_(dateObj);
   const key = Utilities.formatDate(utcDate, "UTC", "yyyy-MM-dd");
-  //Logger.log(`year=${year} key=${key}.`);
 
   let yearly = _euronext_getYearCache_(ticker, year);
-  if (!yearly) {
+
+  // Fetch if cache is null OR if the object is empty
+  if (!yearly || Object.keys(yearly).length === 0) {
+    Logger.log(`Cache miss or empty for ${ticker} ${year}. Fetching...`);
     yearly = _euronext_fetchYearData_(ticker, year);
-    _euronext_setYearCache_(ticker, year, yearly);
+    
+    // Safety: Only cache if we actually got data back
+    if (yearly && Object.keys(yearly).length > 0) {
+      _euronext_setYearCache_(ticker, year, yearly);
+    }
   }
 
   return yearly[key] !== undefined ? yearly[key] : "No data";
+}
+
+function test_EURONEXT_HIST() {
+  Logger.log(EURONEXT_HIST("LU1681048804-XPAR", new Date(2026, 3, 13)));
 }
