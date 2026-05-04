@@ -49,20 +49,21 @@ function _poly_waitForRateLimit_() {
     const now = Date.now();
 
     let ts = JSON.parse(props.getProperty("api_timestamps") || "[]");
-
-    // Keep only last minute
     ts = ts.filter(t => now - t < RATE_PERIOD_MS);
 
     if (ts.length >= RATE_LIMIT) {
       const waitTime = RATE_PERIOD_MS - (now - ts[0]) + 100;
+      lock.releaseLock(); // release BEFORE sleeping
       Utilities.sleep(waitTime);
-      return _poly_waitForRateLimit_(); // retry safely (lock released)
+      _poly_waitForRateLimit_(); // then retry
+      return;
     }
 
     ts.push(now);
     props.setProperty("api_timestamps", JSON.stringify(ts));
   } finally {
-    lock.releaseLock();
+    // Only releases if not already released above
+    try { lock.releaseLock(); } catch (e) {}
   }
 }
 
