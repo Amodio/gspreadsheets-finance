@@ -132,11 +132,21 @@ function ECB_USD_RATE(dateObj) {
   if (!(dateObj instanceof Date)) throw new Error("Argument must be a date");
 
   const utc = _normalizeSheetsDate_(dateObj);
-  const year = utc.getUTCFullYear();
-  const key = Utilities.formatDate(utc, "UTC", "yyyy-MM-dd");
 
-  const yearly = _getYearStore_(year);
-  return yearly ? (yearly[key] ?? "No data") : "No data for this year";
+  // Walk backwards up to 7 days to skip weekends / holidays
+  for (let offset = 0; offset <= 7; offset++) {
+    const candidate = new Date(utc);
+    candidate.setUTCDate(candidate.getUTCDate() - offset);
+
+    const year = candidate.getUTCFullYear();
+    const key  = Utilities.formatDate(candidate, "UTC", "yyyy-MM-dd");
+
+    const yearly = _getYearStore_(year);
+    if (!yearly) continue;            // no cache for this year yet, keep going
+    if (yearly[key] !== undefined) return yearly[key];
+  }
+
+  return "No data";
 }
 
 /* ----------------- Manual flush of the cache ----------------- */
